@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-import os, json, re, time, hashlib, subprocess, shutil
+import os, json, re, time, hashlib, subprocess, shutil, calendar
 from collections import defaultdict
 from urllib.parse import parse_qs, urlparse
 from io import BytesIO
 from PIL import Image
-from datetime import datetime
+from datetime import datetime, date
 import feedparser
 import requests
 from mutagen.id3 import ID3, APIC, USLT, TIT2, TPE1, TALB, TDRC
@@ -351,6 +351,34 @@ def extract_vid(entry) -> str | None:
 
     return None
 
+
+def get_entry_publish_dt(entry) -> datetime | None:
+    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+    if not parsed:
+        return None
+
+    try:
+        ts_utc = calendar.timegm(parsed)
+    except Exception:
+        return None
+
+    return datetime.utcfromtimestamp(ts_utc)
+
+
+def parse_min_publish_date(cfg_value) -> date | None:
+    if cfg_value is None:
+        return None
+
+    raw = str(cfg_value).strip()
+    if not raw:
+        return None
+
+    try:
+        return datetime.strptime(raw, "%Y-%m-%d").date()
+    except ValueError:
+        log(f"Invalid min_publish_date value '{cfg_value}', expected YYYY-MM-DD; feature disabled")
+        return None
+
 def download_audio(url: str, outdir: str, basename: str) -> str:
     os.makedirs(outdir, exist_ok=True)
     # yt-dlp сам вытащит лучшее аудио и сконвертит в mp3 через ffmpeg
@@ -466,6 +494,7 @@ def main():
     jitter_sec = float(cfg.get("jitter_sec", 0.0))
     seen_max_items = int(cfg.get("seen_max_items", 5000))
     tmp_max_age_hours = int(cfg.get("tmp_max_age_hours", 24))
+    min_publish_date = parse_min_publish_date(cfg.get("min_publish_date"))
 
     cleanup_tmp_dir(max_age_hours=tmp_max_age_hours)
 
@@ -515,6 +544,22 @@ def main():
                 skipped_by_reason["already_seen"] += 1
                 continue
 
+            entry_publish_dt = get_entry_publish_dt(e)
+            entry_publish_date = entry_publish_dt.date() if entry_publish_dt else None
+
+            if min_publish_date and vid and entry_publish_date and entry_publish_date < min_publish_date:
+                seen[vid] = {
+                    "url": url,
+                    "skipped_reason": "older_than_min_publish_date",
+                    "skipped_at": datetime.now().isoformat(timespec="seconds"),
+                    "published_date": entry_publish_date.isoformat(),
+                    "title": str(getattr(e, "title", "") or "") or None,
+                    "channel": str(getattr(e, "author", "") or "") or None,
+                }
+                save_seen(seen, seen_max_items=seen_max_items)
+                skipped_by_reason["older_than_min_publish_date"] += 1
+                continue
+
             try:
                 meta = yt_meta(url)
             except Exception as ex:
@@ -527,6 +572,42 @@ def main():
             if vid in seen:
                 skipped_by_reason["already_seen"] += 1
                 continue
+
+            if min_publish_date and entry_publish_date and entry_publish_date < min_publish_date:
+                seen[vid] = {
+                    "url": meta.get("webpage_url") or url,
+                    "skipped_reason": "older_than_min_publish_date",
+                    "skipped_at": datetime.now().isoformat(timespec="seconds"),
+                    "published_date": entry_publish_date.isoformat(),
+                    "title": meta.get("title") or str(getattr(e, "title", "") or "") or None,
+                    "channel": meta.get("channel") or str(getattr(e, "author", "") or "") or None,
+                }
+                save_seen(seen, seen_max_items=seen_max_items)
+                skipped_by_reason["older_than_min_publish_date"] += 1
+                continue
+
+            if min_publish_date and not entry_publish_date:
+                upload_date = str(meta.get("upload_date") or "")
+                meta_publish_date = None
+                if len(upload_date) == 8 and upload_date.isdigit():
+                    try:
+                        meta_publish_date = datetime.strptime(upload_date, "%Y%m%d").date()
+                    except ValueError:
+                        skipped_by_reason["invalid_upload_date"] += 1
+                        log(f"Invalid upload_date in metadata: {upload_date} ({url})")
+
+                if meta_publish_date and meta_publish_date < min_publish_date:
+                    seen[vid] = {
+                        "url": meta.get("webpage_url") or url,
+                        "skipped_reason": "older_than_min_publish_date",
+                        "skipped_at": datetime.now().isoformat(timespec="seconds"),
+                        "published_date": meta_publish_date.isoformat(),
+                        "title": meta.get("title") or None,
+                        "channel": meta.get("channel") or None,
+                    }
+                    save_seen(seen, seen_max_items=seen_max_items)
+                    skipped_by_reason["older_than_min_publish_date"] += 1
+                    continue
 
             if not should_download(meta, min_duration_sec=min_duration_sec, max_duration_sec=max_duration_sec):
                 skipped_by_reason["filtered_out"] += 1
