@@ -93,7 +93,25 @@ def load_seen():
         log(f"Converted seen.json to dict format with {len(converted)} entries")
     return converted
 
-def save_seen(seen):
+def _seen_sort_key(item):
+    vid, meta = item
+    if isinstance(meta, dict):
+        dt = str(meta.get("downloaded_at") or "")
+    else:
+        dt = ""
+    return (dt, str(vid))
+
+
+def save_seen(seen, seen_max_items=5000):
+    seen_max_items = max(1, int(seen_max_items))
+
+    if len(seen) > seen_max_items:
+        overflow = len(seen) - seen_max_items
+        oldest = sorted(seen.items(), key=_seen_sort_key)[:overflow]
+        for vid, _ in oldest:
+            seen.pop(vid, None)
+        log(f"Pruned seen.json entries: removed={overflow}, kept={len(seen)}")
+
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     tmp = DB_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
@@ -370,6 +388,7 @@ def main():
     max_duration_sec_raw = cfg.get("max_duration_sec", 46060)
     max_duration_sec = None if max_duration_sec_raw is None else int(max_duration_sec_raw)
     jitter_sec = float(cfg.get("jitter_sec", 0.0))
+    seen_max_items = int(cfg.get("seen_max_items", 5000))
 
     os.makedirs(library_dir, exist_ok=True)
     seen = load_seen()
@@ -519,7 +538,7 @@ def main():
                     "url": meta["webpage_url"],
                     "downloaded_at": datetime.now().isoformat(timespec="seconds")
                 }
-                save_seen(seen)
+                save_seen(seen, seen_max_items=seen_max_items)
 
                 total_new += 1
                 log(f"OK: {final_path}")
