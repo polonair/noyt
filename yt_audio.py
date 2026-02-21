@@ -590,7 +590,11 @@ def main():
                 upload_date = str(meta.get("upload_date") or "")
                 meta_publish_date = None
                 if len(upload_date) == 8 and upload_date.isdigit():
-                    meta_publish_date = datetime.strptime(upload_date, "%Y%m%d").date()
+                    try:
+                        meta_publish_date = datetime.strptime(upload_date, "%Y%m%d").date()
+                    except ValueError:
+                        skipped_by_reason["invalid_upload_date"] += 1
+                        log(f"Invalid upload_date in metadata: {upload_date} ({url})")
 
                 if meta_publish_date and meta_publish_date < min_publish_date:
                     seen[vid] = {
