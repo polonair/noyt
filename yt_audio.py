@@ -15,6 +15,7 @@ DB_PATH = os.path.join(BASE, "data", "seen.json")
 CHANNEL_STATE_PATH = os.path.join(BASE, "data", "channel_state.json")
 LOG_PATH = os.path.join(BASE, "logs", "run.log")
 TMP_DIR  = os.path.join(BASE, "tmp")
+DEBUG = False
 
 def log(msg: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -22,6 +23,11 @@ def log(msg: str):
     with open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(line)
     print(line, end="")
+
+def debug_log(msg: str):
+    if DEBUG:
+        log(f"DEBUG: {msg}")
+
 
 def safe_name(s: str) -> str:
     s = re.sub(r"[\\/:*?\"<>|]+", "_", s)
@@ -123,6 +129,38 @@ def run(cmd):
         raise RuntimeError(f"Command failed: {cmd[0]}")
     return p.stdout
 
+def _thumb_rank(item):
+    if not isinstance(item, dict):
+        return (-1, 0)
+
+    url = str(item.get("url") or "")
+    url_no_query = url.lower().split("?", 1)[0]
+    jpg_bonus = 1 if url_no_query.endswith((".jpg", ".jpeg")) else 0
+
+    try:
+        h = int(item.get("height") or 0)
+    except (TypeError, ValueError):
+        h = 0
+    try:
+        w = int(item.get("width") or 0)
+    except (TypeError, ValueError):
+        w = 0
+
+    return (h * w, jpg_bonus)
+
+
+def pick_thumbnail_url(j):
+    thumbs = j.get("thumbnails")
+    if isinstance(thumbs, list) and thumbs:
+        best = max(thumbs, key=_thumb_rank)
+        best_url = best.get("url")
+        if best_url:
+            return str(best_url)
+
+    thumb = j.get("thumbnail")
+    return str(thumb) if thumb else None
+
+
 def yt_meta(url: str):
     # Получаем метаданные одним вызовом yt-dlp
     out = run(["yt-dlp", "-J", "--no-warnings", "--no-playlist", url])
@@ -132,7 +170,7 @@ def yt_meta(url: str):
         "title": j.get("title") or "",
         "channel": j.get("channel") or j.get("uploader") or "",
         "upload_date": j.get("upload_date"),  # YYYYMMDD
-        "thumbnail": j.get("thumbnail") or (j.get("thumbnails")[-1]["url"] if j.get("thumbnails") else None),
+        "thumbnail": pick_thumbnail_url(j),
         "description": j.get("description") or "",
         "webpage_url": j.get("webpage_url") or url,
         "is_live": j.get("is_live"),
@@ -228,18 +266,22 @@ def to_jpeg_bytes(img_bytes: bytes) -> bytes:
     im.save(out, format="JPEG", quality=92, optimize=True)
     return out.getvalue()
 
+def is_jpeg_bytes(data: bytes | None) -> bool:
+    return bool(data) and data[:3] == b"\xff\xd8\xff"
+
+
 def set_tags_mp3(path: str, title: str, artist: str, album: str, date_str: str|None, lyrics: str, cover_jpg: bytes|None):
     audio = MP3(path, ID3=ID3)
-    log("2.1")
+    debug_log("set_tags_mp3: ensuring ID3 tag container")
     try:
         audio.add_tags()
     except Exception:
         pass
-    log("2.2")
+    debug_log("set_tags_mp3: clearing APIC/USLT")
     tags = audio.tags
     tags.delall("APIC")
     tags.delall("USLT")
-    log("2.3")
+    debug_log("set_tags_mp3: writing text frames")
     tags.add(TIT2(encoding=3, text=title))
     tags.add(TPE1(encoding=3, text=artist))
     tags.add(TALB(encoding=3, text=album))
@@ -249,9 +291,12 @@ def set_tags_mp3(path: str, title: str, artist: str, album: str, date_str: str|N
     if lyrics:
         tags.add(USLT(encoding=3, lang="rus", desc="desc", text=lyrics))
     if cover_jpg:
+        cover_mime = "image/jpeg" if is_jpeg_bytes(cover_jpg) else "application/octet-stream"
+        if cover_mime != "image/jpeg":
+            log("Cover bytes are not JPEG; writing APIC with generic mime")
         tags.add(APIC(
             encoding=3,
-            mime="image/jpeg",
+            mime=cover_mime,
             type=3,
             desc="cover",
             data=cover_jpg
@@ -268,16 +313,18 @@ def set_tags_mp3(path: str, title: str, artist: str, album: str, date_str: str|N
     #        ))
     #    except Exception as ex:
     #        log(f"APIC failed: {ex}")
-    log("2.L")
     audio.save(v2_version=3)
-    log("2.L+1")
+    debug_log("set_tags_mp3: save complete")
 
 def main():
+    global DEBUG
     os.makedirs(TMP_DIR, exist_ok=True)
 
     cfg_path = os.path.join(BASE, "config.json")
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
+
+    DEBUG = bool(cfg.get("debug", False))
 
     download_per_run = int(cfg.get("download_per_run", 2))
     randomize_feeds = bool(cfg.get("randomize_feeds", True))
@@ -359,15 +406,23 @@ def main():
                 cover = None
                 if meta.get("thumbnail"):
                     try:
-                        cover = fetch_bytes(meta["thumbnail"])
+                        thumb_url = meta["thumbnail"]
+                        cover_raw = fetch_bytes(thumb_url)
+                        thumb_path = thumb_url.lower().split("?", 1)[0]
+                        if thumb_path.endswith((".jpg", ".jpeg")) and is_jpeg_bytes(cover_raw):
+                            cover = cover_raw
+                            debug_log(f"Cover kept as JPEG: {thumb_url}")
+                        else:
+                            cover = to_jpeg_bytes(cover_raw)
+                            debug_log(f"Cover converted to JPEG: {thumb_url}")
                     except Exception as ex:
-                        log(f"Cover fetch failed: {ex}")
-                log("1")
+                        log(f"Cover fetch/convert failed: {ex}")
+                debug_log("main: cover prepared")
                 lyrics = meta.get("description", "")
                 if meta.get("webpage_url"):
                     # добавим ссылку в конец, чтобы всегда можно было открыть оригинал
                     lyrics = (lyrics or "").rstrip() + "\n\n" + meta["webpage_url"]
-                log("2")
+                debug_log("main: writing ID3 tags")
                 set_tags_mp3(
                     mp3_path,
                     title=title,
@@ -377,7 +432,7 @@ def main():
                     lyrics=lyrics,
                     cover_jpg=cover
                 )
-                log("3")
+                debug_log("main: tags written")
                 # атомарное перемещение в библиотеку
                 #final_path = os.path.join(library_dir, os.path.basename(mp3_path))
 
