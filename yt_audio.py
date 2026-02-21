@@ -110,6 +110,8 @@ def select_channels(channel_ids, state, channels_per_run):
     if not channel_ids:
         return []
     ordered = sorted(channel_ids, key=lambda cid: int(state.get(cid, {}).get("last_checked_at", 0)))
+    if channels_per_run is None:
+        return ordered
     return ordered[:max(0, channels_per_run)]
 
 def run(cmd):
@@ -244,12 +246,11 @@ def main():
         cfg = json.load(f)
 
     download_per_run = int(cfg.get("download_per_run", 2))
-    channels_per_run = int(cfg.get("channels_per_run", 3))
     randomize_feeds = bool(cfg.get("randomize_feeds", True))
-
     library_dir = cfg["library_dir"]
-
     channel_ids = cfg.get("channel_ids", [])
+    channels_per_run_raw = cfg.get("channels_per_run")
+    channels_per_run = None if channels_per_run_raw is None else int(channels_per_run_raw)
     max_per_feed = int(cfg.get("max_per_feed", 20))
 
     os.makedirs(library_dir, exist_ok=True)
