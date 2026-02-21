@@ -228,7 +228,8 @@ def yt_meta(url: str):
 
 def should_download(meta, min_duration_sec, max_duration_sec):
     live_status = str(meta.get("live_status") or "").lower()
-    if bool(meta.get("is_live")) or ("live" in live_status and "not_live" not in live_status) or ("upcoming" in live_status):
+    active_live_statuses = {"is_live", "live", "is_upcoming", "upcoming"}
+    if bool(meta.get("is_live")) or live_status in active_live_statuses:
         log(
             f"Skip (live/upcoming): {meta.get('webpage_url')} "
             f"is_live={meta.get('is_live')} live_status={meta.get('live_status')}"
