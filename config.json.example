@@ -8,6 +8,7 @@
   "retry_backoff_sec": 5,
   "jitter_sec": 1.5,
   "seen_max_items": 5000,
+  "tmp_max_age_hours": 24,
   "min_duration_sec": 30,
   "max_duration_sec": 46060,
   "channel_ids": [

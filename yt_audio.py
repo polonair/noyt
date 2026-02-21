@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, json, re, time, hashlib, subprocess
+import os, json, re, time, hashlib, subprocess, shutil
 from collections import defaultdict
 from urllib.parse import parse_qs, urlparse
 from io import BytesIO
@@ -51,6 +51,81 @@ def with_retries(action_name: str, fn, retries: int | None = None, backoff_sec: 
                 time.sleep(wait_s)
 
     raise last_ex
+
+
+def is_within_tmp_dir(path: str) -> bool:
+    abs_tmp = os.path.abspath(TMP_DIR)
+    abs_path = os.path.abspath(path)
+    return abs_path == abs_tmp or abs_path.startswith(abs_tmp + os.sep)
+
+
+def _dir_size_bytes(path: str) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            fp = os.path.join(root, name)
+            try:
+                total += os.path.getsize(fp)
+            except Exception:
+                pass
+    return total
+
+
+def cleanup_tmp_out(tmp_out: str, mp3_path: str | None = None):
+    if not tmp_out or not is_within_tmp_dir(tmp_out):
+        debug_log(f"Skip tmp cleanup outside TMP_DIR: {tmp_out}")
+        return
+
+    if mp3_path and os.path.exists(mp3_path):
+        try:
+            os.remove(mp3_path)
+            debug_log(f"Removed temp mp3: {mp3_path}")
+        except Exception as ex:
+            debug_log(f"Failed to remove temp mp3: {mp3_path} -> {ex}")
+
+    if not os.path.exists(tmp_out):
+        return
+
+    try:
+        os.rmdir(tmp_out)
+        debug_log(f"Removed empty temp dir: {tmp_out}")
+    except Exception:
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        debug_log(f"Removed temp dir recursively: {tmp_out}")
+
+
+def cleanup_tmp_dir(max_age_hours: int = 24):
+    os.makedirs(TMP_DIR, exist_ok=True)
+    threshold_ts = time.time() - max(0, int(max_age_hours)) * 3600
+
+    removed_dirs = 0
+    freed_bytes = 0
+
+    for name in os.listdir(TMP_DIR):
+        path = os.path.join(TMP_DIR, name)
+        if not os.path.isdir(path):
+            continue
+        if not is_within_tmp_dir(path):
+            debug_log(f"Skip cleanup outside TMP_DIR: {path}")
+            continue
+
+        try:
+            mtime = os.path.getmtime(path)
+        except Exception:
+            continue
+
+        if mtime > threshold_ts:
+            continue
+
+        size_bytes = _dir_size_bytes(path)
+        shutil.rmtree(path, ignore_errors=True)
+        if not os.path.exists(path):
+            removed_dirs += 1
+            freed_bytes += size_bytes
+            debug_log(f"Removed stale tmp dir: {path}")
+
+    freed_mb = freed_bytes / (1024 * 1024)
+    log(f"TMP cleanup: removed {removed_dirs} directories, freed approx {freed_mb:.1f} MB")
 
 
 def safe_name(s: str) -> str:
@@ -390,6 +465,9 @@ def main():
     max_duration_sec = None if max_duration_sec_raw is None else int(max_duration_sec_raw)
     jitter_sec = float(cfg.get("jitter_sec", 0.0))
     seen_max_items = int(cfg.get("seen_max_items", 5000))
+    tmp_max_age_hours = int(cfg.get("tmp_max_age_hours", 24))
+
+    cleanup_tmp_dir(max_age_hours=tmp_max_age_hours)
 
     os.makedirs(library_dir, exist_ok=True)
     seen = load_seen()
@@ -473,6 +551,7 @@ def main():
             tmp_out = os.path.join(TMP_DIR, base)
             os.makedirs(tmp_out, exist_ok=True)
 
+            mp3_path = None
             try:
                 mp3_path = download_audio(meta["webpage_url"], tmp_out, base)
                 log(f"{mp3_path}")
@@ -532,6 +611,7 @@ def main():
                             break
                         dst.write(b)
                 os.replace(tmp_final, final_path)
+                cleanup_tmp_out(tmp_out, mp3_path=mp3_path)
 
                 seen[vid] = {
                     "title": title,
@@ -551,6 +631,7 @@ def main():
                     debug_log(f"Notification failed: {ex}")
 
             except Exception as ex:
+                cleanup_tmp_out(tmp_out, mp3_path=mp3_path)
                 skipped_by_reason["download_or_tag_failed"] += 1
                 log(f"FAIL: {url} -> {ex}")
 
