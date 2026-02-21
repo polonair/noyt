@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os, json, re, time, hashlib, subprocess
+from urllib.parse import parse_qs, urlparse
 from io import BytesIO
 from PIL import Image
 from datetime import datetime
@@ -61,6 +62,26 @@ def yt_meta(url: str):
         "description": j.get("description") or "",
         "webpage_url": j.get("webpage_url") or url
     }
+
+def extract_vid(entry) -> str | None:
+    yt_videoid = entry.get("yt_videoid")
+    if yt_videoid:
+        return str(yt_videoid)
+
+    entry_id = entry.get("id")
+    if entry_id:
+        match = re.match(r"^yt:video:([A-Za-z0-9_-]{6,})$", str(entry_id))
+        if match:
+            return match.group(1)
+
+    link = entry.get("link")
+    if link:
+        parsed = urlparse(str(link))
+        vid = parse_qs(parsed.query).get("v", [None])[0]
+        if vid:
+            return vid
+
+    return None
 
 def download_audio(url: str, outdir: str, basename: str) -> str:
     os.makedirs(outdir, exist_ok=True)
@@ -181,13 +202,20 @@ def main():
                 continue
             log(f"Link: {url}")
             # ключ дедупликации — видео id, если нет — хэш ссылки
-            vid = None
+            vid = extract_vid(e)
+            if not vid:
+                log(f"Could not extract video id from entry: {url}")
+
+            if vid and vid in seen:
+                continue
+
             try:
                 meta = yt_meta(url)
-                vid = meta["id"] or hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
             except Exception as ex:
                 log(f"Meta failed: {url} -> {ex}")
                 continue
+
+            vid = vid or meta["id"] or hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
 
             if vid in seen:
                 continue
