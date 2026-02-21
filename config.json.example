@@ -3,6 +3,8 @@
   "poll_minutes": 15,
   "max_per_feed": 3,
   "download_per_run": 3,
+  "min_duration_sec": 30,
+  "max_duration_sec": 46060,
   "channel_ids": [
     "UCwdFktjRfL1MuLiLIpmVQtg",
     "UCBzDAjLfvBUBVMMP6-K-y0w",

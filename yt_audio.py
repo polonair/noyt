@@ -134,8 +134,42 @@ def yt_meta(url: str):
         "upload_date": j.get("upload_date"),  # YYYYMMDD
         "thumbnail": j.get("thumbnail") or (j.get("thumbnails")[-1]["url"] if j.get("thumbnails") else None),
         "description": j.get("description") or "",
-        "webpage_url": j.get("webpage_url") or url
+        "webpage_url": j.get("webpage_url") or url,
+        "is_live": j.get("is_live"),
+        "live_status": j.get("live_status"),
+        "duration": j.get("duration"),
+        "availability": j.get("availability"),
     }
+
+
+def should_download(meta, min_duration_sec, max_duration_sec):
+    live_status = str(meta.get("live_status") or "").lower()
+    if bool(meta.get("is_live")) or ("live" in live_status and "not_live" not in live_status) or ("upcoming" in live_status):
+        log(
+            f"Skip (live/upcoming): {meta.get('webpage_url')} "
+            f"is_live={meta.get('is_live')} live_status={meta.get('live_status')}"
+        )
+        return False
+
+    duration = meta.get("duration")
+    try:
+        duration_sec = int(duration)
+    except (TypeError, ValueError):
+        duration_sec = 0
+
+    if duration_sec <= 0:
+        log(f"Skip (invalid duration={duration}): {meta.get('webpage_url')}")
+        return False
+
+    if duration_sec < min_duration_sec:
+        log(f"Skip (duration {duration_sec}s < min_duration_sec={min_duration_sec}): {meta.get('webpage_url')}")
+        return False
+
+    if max_duration_sec is not None and duration_sec > max_duration_sec:
+        log(f"Skip (duration {duration_sec}s > max_duration_sec={max_duration_sec}): {meta.get('webpage_url')}")
+        return False
+
+    return True
 
 def extract_vid(entry) -> str | None:
     yt_videoid = entry.get("yt_videoid")
@@ -252,6 +286,9 @@ def main():
     channels_per_run_raw = cfg.get("channels_per_run")
     channels_per_run = None if channels_per_run_raw is None else int(channels_per_run_raw)
     max_per_feed = int(cfg.get("max_per_feed", 20))
+    min_duration_sec = int(cfg.get("min_duration_sec", 30))
+    max_duration_sec_raw = cfg.get("max_duration_sec", 46060)
+    max_duration_sec = None if max_duration_sec_raw is None else int(max_duration_sec_raw)
 
     os.makedirs(library_dir, exist_ok=True)
     seen = load_seen()
@@ -292,6 +329,9 @@ def main():
             vid = vid or meta["id"] or hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
 
             if vid in seen:
+                continue
+
+            if not should_download(meta, min_duration_sec=min_duration_sec, max_duration_sec=max_duration_sec):
                 continue
 
             if total_new >= download_per_run:
