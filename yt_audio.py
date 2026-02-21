@@ -544,10 +544,10 @@ def main():
                 log(f"OK: {final_path}")
 
                 # уведомление на телефон (если установлен termux-api)
-                #try:
-                #    subprocess.run(["termux-notification", "--title", "YT Audio", "--content", title], check=False)
-                #except Exception:
-                #    pass
+                try:
+                    subprocess.run(["termux-notification", "--title", "YT Audio", "--content", title], check=False)
+                except Exception as ex:
+                    debug_log(f"Notification failed: {ex}")
 
             except Exception as ex:
                 skipped_by_reason["download_or_tag_failed"] += 1
