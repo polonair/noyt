@@ -12,6 +12,7 @@ import random
 
 BASE = os.path.expanduser("~/yt-audio")
 DB_PATH = os.path.join(BASE, "data", "seen.json")
+CHANNEL_STATE_PATH = os.path.join(BASE, "data", "channel_state.json")
 LOG_PATH = os.path.join(BASE, "logs", "run.log")
 TMP_DIR  = os.path.join(BASE, "tmp")
 
@@ -30,8 +31,37 @@ def safe_name(s: str) -> str:
 def load_seen():
     if not os.path.exists(DB_PATH):
         return {}
-    with open(DB_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+
+    try:
+        with open(DB_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as ex:
+        bak = f"{DB_PATH}.bak.{int(time.time())}"
+        try:
+            os.replace(DB_PATH, bak)
+            log(f"seen.json parse failed, moved to backup: {bak} ({ex})")
+        except Exception as bak_ex:
+            log(f"seen.json parse failed and backup failed: {ex}; backup error: {bak_ex}")
+        return {}
+
+    if isinstance(data, dict):
+        return data
+
+    converted = {}
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, str):
+                converted[item] = {}
+            elif isinstance(item, dict):
+                vid = item.get("vid") or item.get("id") or item.get("video_id")
+                if vid:
+                    converted[str(vid)] = item
+    else:
+        log(f"Unexpected seen.json format: {type(data).__name__}; using empty state")
+
+    if converted:
+        log(f"Converted seen.json to dict format with {len(converted)} entries")
+    return converted
 
 def save_seen(seen):
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -39,6 +69,48 @@ def save_seen(seen):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(seen, f, ensure_ascii=False, indent=2)
     os.replace(tmp, DB_PATH)
+
+def load_channel_state(channel_ids):
+    state = {}
+    if os.path.exists(CHANNEL_STATE_PATH):
+        try:
+            with open(CHANNEL_STATE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for cid, meta in data.items():
+                    if isinstance(meta, dict):
+                        state[cid] = {
+                            "last_checked_at": int(meta.get("last_checked_at") or 0),
+                            "fail_count": int(meta.get("fail_count") or 0),
+                        }
+        except Exception as ex:
+            log(f"Failed to load channel_state.json: {ex}; starting fresh")
+
+    changed = False
+    for cid in channel_ids:
+        if cid not in state:
+            state[cid] = {"last_checked_at": 0, "fail_count": 0}
+            changed = True
+
+    if changed or not os.path.exists(CHANNEL_STATE_PATH):
+        save_channel_state(state)
+
+    return state
+
+
+def save_channel_state(state):
+    os.makedirs(os.path.dirname(CHANNEL_STATE_PATH), exist_ok=True)
+    tmp = CHANNEL_STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CHANNEL_STATE_PATH)
+
+
+def select_channels(channel_ids, state, channels_per_run):
+    if not channel_ids:
+        return []
+    ordered = sorted(channel_ids, key=lambda cid: int(state.get(cid, {}).get("last_checked_at", 0)))
+    return ordered[:max(0, channels_per_run)]
 
 def run(cmd):
     log("RUN: " + " ".join(cmd))
@@ -172,25 +244,26 @@ def main():
         cfg = json.load(f)
 
     download_per_run = int(cfg.get("download_per_run", 2))
+    channels_per_run = int(cfg.get("channels_per_run", 3))
     randomize_feeds = bool(cfg.get("randomize_feeds", True))
 
     library_dir = cfg["library_dir"]
-    #feeds = cfg.get("feeds", [])
 
     channel_ids = cfg.get("channel_ids", [])
-    feeds = [f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}" for cid in channel_ids]
-
     max_per_feed = int(cfg.get("max_per_feed", 20))
 
     os.makedirs(library_dir, exist_ok=True)
     seen = load_seen()
+    channel_state = load_channel_state(channel_ids)
+
+    selected_channels = select_channels(channel_ids, channel_state, channels_per_run)
+    if randomize_feeds:
+        random.shuffle(selected_channels)
 
     total_new = 0
 
-    if randomize_feeds:
-        random.shuffle(feeds)
-
-    for feed_url in feeds:
+    for channel_id in selected_channels:
+        feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
         log(f"Feed: {feed_url}")
         d = feedparser.parse(feed_url)
         #log(f"d = {d}")
@@ -222,6 +295,8 @@ def main():
 
             if total_new >= download_per_run:
                 log(f"Reached download_per_run={download_per_run}, stopping.")
+                channel_state[channel_id]["last_checked_at"] = int(time.time())
+                save_channel_state(channel_state)
                 log(f"Done. New items: {total_new}")
                 return
 
@@ -309,6 +384,9 @@ def main():
 
             except Exception as ex:
                 log(f"FAIL: {url} -> {ex}")
+
+        channel_state[channel_id]["last_checked_at"] = int(time.time())
+        save_channel_state(channel_state)
 
     log(f"Done. New items: {total_new}")
 
