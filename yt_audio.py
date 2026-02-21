@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os, json, re, time, hashlib, subprocess
+from collections import defaultdict
 from urllib.parse import parse_qs, urlparse
 from io import BytesIO
 from PIL import Image
@@ -16,8 +17,11 @@ CHANNEL_STATE_PATH = os.path.join(BASE, "data", "channel_state.json")
 LOG_PATH = os.path.join(BASE, "logs", "run.log")
 TMP_DIR  = os.path.join(BASE, "tmp")
 DEBUG = False
+RETRIES = 2
+RETRY_BACKOFF_SEC = 5
 
 def log(msg: str):
+    os.makedirs(os.path.dirname(LOG_PATH), exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     line = f"[{ts}] {msg}\n"
     with open(LOG_PATH, "a", encoding="utf-8") as f:
@@ -27,6 +31,26 @@ def log(msg: str):
 def debug_log(msg: str):
     if DEBUG:
         log(f"DEBUG: {msg}")
+
+
+def with_retries(action_name: str, fn, retries: int | None = None, backoff_sec: int | None = None):
+    max_attempts = max(1, (RETRIES if retries is None else retries) + 1)
+    wait_base = RETRY_BACKOFF_SEC if backoff_sec is None else backoff_sec
+
+    last_ex = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return fn()
+        except Exception as ex:
+            last_ex = ex
+            if attempt >= max_attempts:
+                break
+            wait_s = max(0, wait_base) * attempt
+            log(f"{action_name} failed (attempt {attempt}/{max_attempts}): {ex}; retry in {wait_s}s")
+            if wait_s > 0:
+                time.sleep(wait_s)
+
+    raise last_ex
 
 
 def safe_name(s: str) -> str:
@@ -120,7 +144,7 @@ def select_channels(channel_ids, state, channels_per_run):
         return ordered
     return ordered[:max(0, channels_per_run)]
 
-def run(cmd):
+def run_once(cmd):
     log("RUN: " + " ".join(cmd))
     p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if p.returncode != 0:
@@ -128,6 +152,10 @@ def run(cmd):
         log("STDERR:\n" + (p.stderr[-2000:] if p.stderr else ""))
         raise RuntimeError(f"Command failed: {cmd[0]}")
     return p.stdout
+
+
+def run(cmd):
+    return with_retries(f"Command {' '.join(cmd[:2])}", lambda: run_once(cmd))
 
 def _thumb_rank(item):
     if not isinstance(item, dict):
@@ -254,9 +282,12 @@ def download_audio(url: str, outdir: str, basename: str) -> str:
     return mp3
 
 def fetch_bytes(url: str) -> bytes:
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    return r.content
+    def _do_fetch():
+        r = requests.get(url, timeout=30)
+        r.raise_for_status()
+        return r.content
+
+    return with_retries(f"Fetch failed: {url}", _do_fetch)
 
 def to_jpeg_bytes(img_bytes: bytes) -> bytes:
     im = Image.open(BytesIO(img_bytes))
@@ -317,7 +348,7 @@ def set_tags_mp3(path: str, title: str, artist: str, album: str, date_str: str|N
     debug_log("set_tags_mp3: save complete")
 
 def main():
-    global DEBUG
+    global DEBUG, RETRIES, RETRY_BACKOFF_SEC
     os.makedirs(TMP_DIR, exist_ok=True)
 
     cfg_path = os.path.join(BASE, "config.json")
@@ -325,6 +356,8 @@ def main():
         cfg = json.load(f)
 
     DEBUG = bool(cfg.get("debug", False))
+    RETRIES = int(cfg.get("retries", 2))
+    RETRY_BACKOFF_SEC = int(cfg.get("retry_backoff_sec", 5))
 
     download_per_run = int(cfg.get("download_per_run", 2))
     randomize_feeds = bool(cfg.get("randomize_feeds", True))
@@ -336,6 +369,7 @@ def main():
     min_duration_sec = int(cfg.get("min_duration_sec", 30))
     max_duration_sec_raw = cfg.get("max_duration_sec", 46060)
     max_duration_sec = None if max_duration_sec_raw is None else int(max_duration_sec_raw)
+    jitter_sec = float(cfg.get("jitter_sec", 0.0))
 
     os.makedirs(library_dir, exist_ok=True)
     seen = load_seen()
@@ -346,8 +380,22 @@ def main():
         random.shuffle(selected_channels)
 
     total_new = 0
+    channels_checked = 0
+    skipped_by_reason = defaultdict(int)
+
+    def finish_run():
+        reason_parts = ", ".join(f"{k}={v}" for k, v in sorted(skipped_by_reason.items())) or "none"
+        log(
+            f"Summary: channels_checked={channels_checked}/{len(selected_channels)}, "
+            f"downloaded={total_new}, skipped={{ {reason_parts} }}"
+        )
+        if jitter_sec > 0:
+            jitter_sleep = random.uniform(0, jitter_sec)
+            log(f"Jitter sleep: {jitter_sleep:.2f}s")
+            time.sleep(jitter_sleep)
 
     for channel_id in selected_channels:
+        channels_checked += 1
         feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
         log(f"Feed: {feed_url}")
         d = feedparser.parse(feed_url)
@@ -357,6 +405,7 @@ def main():
         for e in entries:
             url = getattr(e, "link", None)
             if not url:
+                skipped_by_reason["entry_without_link"] += 1
                 continue
             log(f"Link: {url}")
             # ключ дедупликации — видео id, если нет — хэш ссылки
@@ -365,27 +414,31 @@ def main():
                 log(f"Could not extract video id from entry: {url}")
 
             if vid and vid in seen:
+                skipped_by_reason["already_seen"] += 1
                 continue
 
             try:
                 meta = yt_meta(url)
             except Exception as ex:
+                skipped_by_reason["meta_failed"] += 1
                 log(f"Meta failed: {url} -> {ex}")
                 continue
 
             vid = vid or meta["id"] or hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
 
             if vid in seen:
+                skipped_by_reason["already_seen"] += 1
                 continue
 
             if not should_download(meta, min_duration_sec=min_duration_sec, max_duration_sec=max_duration_sec):
+                skipped_by_reason["filtered_out"] += 1
                 continue
 
             if total_new >= download_per_run:
                 log(f"Reached download_per_run={download_per_run}, stopping.")
                 channel_state[channel_id]["last_checked_at"] = int(time.time())
                 save_channel_state(channel_state)
-                log(f"Done. New items: {total_new}")
+                finish_run()
                 return
 
             title = meta["title"]
@@ -416,6 +469,7 @@ def main():
                             cover = to_jpeg_bytes(cover_raw)
                             debug_log(f"Cover converted to JPEG: {thumb_url}")
                     except Exception as ex:
+                        skipped_by_reason["cover_fetch_or_convert_failed"] += 1
                         log(f"Cover fetch/convert failed: {ex}")
                 debug_log("main: cover prepared")
                 lyrics = meta.get("description", "")
@@ -450,7 +504,6 @@ def main():
                 final_path = os.path.join(library_dir, final_name)
 
                 tmp_final = final_path + ".tmp"
-                log("4")
                 # copy+replace на случай разных FS
                 with open(mp3_path, "rb") as src, open(tmp_final, "wb") as dst:
                     while True:
@@ -458,7 +511,6 @@ def main():
                         if not b:
                             break
                         dst.write(b)
-                log("5")
                 os.replace(tmp_final, final_path)
 
                 seen[vid] = {
@@ -479,12 +531,13 @@ def main():
                 #    pass
 
             except Exception as ex:
+                skipped_by_reason["download_or_tag_failed"] += 1
                 log(f"FAIL: {url} -> {ex}")
 
         channel_state[channel_id]["last_checked_at"] = int(time.time())
         save_channel_state(channel_state)
 
-    log(f"Done. New items: {total_new}")
+    finish_run()
 
 if __name__ == "__main__":
     main()

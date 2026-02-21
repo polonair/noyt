@@ -4,6 +4,9 @@
   "max_per_feed": 3,
   "download_per_run": 3,
   "debug": false,
+  "retries": 2,
+  "retry_backoff_sec": 5,
+  "jitter_sec": 1.5,
   "min_duration_sec": 30,
   "max_duration_sec": 46060,
   "channel_ids": [
