@@ -850,8 +850,7 @@ def main():
     randomize_feeds = bool(cfg.get("randomize_feeds", True))
     library_dir = cfg["library_dir"]
     channel_ids = cfg.get("channel_ids", [])
-    channels_per_run_raw = cfg.get("channels_per_run")
-    channels_per_run = None if channels_per_run_raw is None else int(channels_per_run_raw)
+    channels_per_run = int(cfg.get("channels_per_run", 10))
     max_per_feed = int(cfg.get("max_per_feed", 20))
     min_duration_sec = int(cfg.get("min_duration_sec", 30))
     max_duration_sec_raw = cfg.get("max_duration_sec", 46060)
