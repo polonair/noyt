@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os, json, re, time, hashlib, subprocess, shutil, calendar
+from contextlib import contextmanager
 from collections import defaultdict
 from urllib.parse import parse_qs, urlparse
 from io import BytesIO
@@ -16,6 +17,7 @@ DB_PATH = os.path.join(BASE, "data", "seen.json")
 CHANNEL_STATE_PATH = os.path.join(BASE, "data", "channel_state.json")
 LOG_PATH = os.path.join(BASE, "logs", "run.log")
 TMP_DIR  = os.path.join(BASE, "tmp")
+LOCK_PATH = os.path.join(BASE, "yt_audio.lock")
 DEBUG = False
 RETRIES = 2
 RETRY_BACKOFF_SEC = 5
@@ -31,6 +33,152 @@ def log(msg: str):
 def debug_log(msg: str):
     if DEBUG:
         log(f"DEBUG: {msg}")
+
+
+def _get_proc_start_ticks(pid: int) -> int | None:
+    stat_path = f"/proc/{pid}/stat"
+    try:
+        with open(stat_path, "r", encoding="utf-8") as f:
+            stat_line = f.read().strip()
+    except Exception:
+        return None
+
+    close_idx = stat_line.rfind(")")
+    if close_idx == -1:
+        return None
+
+    rest = stat_line[close_idx + 2 :].split()
+    if len(rest) < 20:
+        return None
+
+    try:
+        return int(rest[19])
+    except Exception:
+        return None
+
+
+def _read_lock_info() -> dict | None:
+    try:
+        with open(LOCK_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _is_lock_owner_alive(lock_info: dict | None) -> bool:
+    if not isinstance(lock_info, dict):
+        return False
+
+    try:
+        pid = int(lock_info.get("pid"))
+    except Exception:
+        return False
+
+    if pid <= 0:
+        return False
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+    expected_ticks = lock_info.get("proc_start_ticks")
+    if expected_ticks is not None:
+        current_ticks = _get_proc_start_ticks(pid)
+        if current_ticks is None:
+            return False
+        try:
+            if int(expected_ticks) != int(current_ticks):
+                return False
+        except Exception:
+            return False
+
+    script_name = os.path.basename(__file__)
+    cmdline_path = f"/proc/{pid}/cmdline"
+    try:
+        with open(cmdline_path, "rb") as f:
+            cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
+        # cmdline используется только как дополнительная эвристика и не должен
+        # опровергать валидность живого процесса-владельца (например, при запуске
+        # через обёртку, симлинк или `python -m`).
+        if script_name and script_name in cmdline:
+            debug_log(f"Lock owner cmdline matches script name: pid={pid}")
+    except Exception:
+        # Если cmdline недоступен, PID+start_ticks уже дают достаточную защиту.
+        pass
+
+    return True
+
+
+@contextmanager
+def single_instance_lock():
+    os.makedirs(BASE, exist_ok=True)
+    lock_fd = None
+    lock_acquired = False
+    lock_info = {
+        "pid": os.getpid(),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "script": os.path.abspath(__file__),
+        "proc_start_ticks": _get_proc_start_ticks(os.getpid()),
+    }
+
+    while True:
+        try:
+            lock_fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            os.write(lock_fd, json.dumps(lock_info, ensure_ascii=False).encode("utf-8"))
+            os.fsync(lock_fd)
+            lock_acquired = True
+            log(f"Single instance lock acquired: {LOCK_PATH} (pid={lock_info['pid']})")
+            break
+        except FileExistsError:
+            existing = None
+            for _ in range(5):
+                existing = _read_lock_info()
+                if isinstance(existing, dict):
+                    break
+                # Защита от гонки: файл уже создан, но владелец ещё не успел
+                # дописать JSON-метаданные. Нельзя сразу считать lock устаревшим.
+                time.sleep(0.05)
+
+            if _is_lock_owner_alive(existing):
+                owner_pid = existing.get("pid") if isinstance(existing, dict) else "unknown"
+                log(f"Refusing to start: another instance is running (pid={owner_pid})")
+                break
+
+            if existing is None:
+                log(f"Lock file exists but metadata is not readable yet: {LOCK_PATH}; refusing to start")
+                break
+
+            try:
+                os.remove(LOCK_PATH)
+                log(f"Removed stale lock file: {LOCK_PATH}")
+            except FileNotFoundError:
+                continue
+            except Exception as ex:
+                log(f"Failed to remove stale lock file: {LOCK_PATH} ({ex})")
+                break
+
+    try:
+        yield lock_acquired
+    finally:
+        if lock_fd is not None:
+            try:
+                os.close(lock_fd)
+            except Exception:
+                pass
+
+        if lock_acquired:
+            try:
+                current = _read_lock_info()
+                if isinstance(current, dict) and int(current.get("pid") or -1) == os.getpid():
+                    os.remove(LOCK_PATH)
+            except FileNotFoundError:
+                pass
+            except Exception as ex:
+                log(f"Failed to release lock file: {LOCK_PATH} ({ex})")
 
 
 def with_retries(action_name: str, fn, retries: int | None = None, backoff_sec: int | None = None):
@@ -722,4 +870,6 @@ def main():
     finish_run()
 
 if __name__ == "__main__":
-    main()
+    with single_instance_lock() as acquired:
+        if acquired:
+            main()
