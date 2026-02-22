@@ -13,8 +13,6 @@ from mutagen.mp3 import MP3
 import random
 
 BASE = os.path.expanduser("~/yt-audio")
-SEEN_JSON_PATH = os.path.join(BASE, "data", "seen.json")
-CHANNEL_STATE_JSON_PATH = os.path.join(BASE, "data", "channel_state.json")
 STATE_DB_PATH = os.path.join(BASE, "data", "state.db")
 LOG_PATH = os.path.join(BASE, "logs", "run.log")
 TMP_DIR  = os.path.join(BASE, "tmp")
@@ -282,69 +280,6 @@ def safe_name(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s[:180]
 
-
-def _load_json_file(path: str, label: str, backup_on_failure: bool):
-    if not os.path.exists(path):
-        return None
-
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as ex:
-        if backup_on_failure:
-            bak = f"{path}.bak.{int(time.time())}"
-            try:
-                os.replace(path, bak)
-                log(f"{label} parse failed, moved to backup: {bak} ({ex})")
-            except Exception as bak_ex:
-                log(f"{label} parse failed and backup failed: {ex}; backup error: {bak_ex}")
-        else:
-            log(f"Failed to load {label}: {ex}; starting fresh")
-        return None
-
-
-def _parse_seen_payload(data):
-    if isinstance(data, dict):
-        return data
-
-    converted = {}
-    if isinstance(data, list):
-        for item in data:
-            if isinstance(item, str):
-                converted[item] = {}
-            elif isinstance(item, dict):
-                vid = item.get("vid") or item.get("id") or item.get("video_id")
-                if vid:
-                    converted[str(vid)] = item
-    elif data is not None:
-        log(f"Unexpected seen.json format: {type(data).__name__}; using empty state")
-
-    if converted:
-        log(f"Converted seen.json to dict format with {len(converted)} entries")
-    return converted
-
-
-def _parse_channel_state_payload(data):
-    state = {}
-    if not isinstance(data, dict):
-        return state
-
-    for cid, meta in data.items():
-        if isinstance(meta, dict):
-            state[str(cid)] = {
-                "last_checked_at": int(meta.get("last_checked_at") or 0),
-                "fail_count": int(meta.get("fail_count") or 0),
-            }
-    return state
-
-
-def _seen_sort_key(item):
-    vid, meta = item
-    if isinstance(meta, dict):
-        dt = str(meta.get("downloaded_at") or "")
-    else:
-        dt = ""
-    return (dt, str(vid))
 
 
 class StateStore:
@@ -657,50 +592,6 @@ def close_state_store():
     finally:
         _STATE_STORE = None
 
-def run_state_migration_if_needed():
-    os.makedirs(os.path.dirname(STATE_DB_PATH), exist_ok=True)
-
-    db_exists = os.path.exists(STATE_DB_PATH)
-    seen_exists = os.path.exists(SEEN_JSON_PATH)
-    channel_exists = os.path.exists(CHANNEL_STATE_JSON_PATH)
-
-    if db_exists:
-        return
-
-    if not (seen_exists or channel_exists):
-        return
-
-    log("State migration: detected legacy JSON state and no SQLite DB; starting migration")
-
-    seen_payload = _load_json_file(SEEN_JSON_PATH, "seen.json", backup_on_failure=True)
-    channel_payload = _load_json_file(CHANNEL_STATE_JSON_PATH, "channel_state.json", backup_on_failure=False)
-
-    seen_state = _parse_seen_payload(seen_payload)
-    channel_state = _parse_channel_state_payload(channel_payload)
-
-    store = StateStore(STATE_DB_PATH)
-    try:
-        if seen_state:
-            store.save_seen(dict(seen_state), seen_max_items=max(1, len(seen_state)))
-        if channel_state:
-            store.save_channel_state(channel_state)
-    finally:
-        store.close()
-
-    suffix = datetime.now().strftime("%Y%m%d%H%M%S")
-    for path in (SEEN_JSON_PATH, CHANNEL_STATE_JSON_PATH):
-        if os.path.exists(path):
-            migrated_path = f"{path}.migrated.{suffix}"
-            try:
-                os.replace(path, migrated_path)
-                log(f"Renamed migrated legacy state file: {migrated_path}")
-            except Exception as ex:
-                log(f"Failed to rename migrated state file {path}: {ex}")
-
-    log(
-        f"State migration completed: seen={len(seen_state)}, channel_state={len(channel_state)}, db={STATE_DB_PATH}"
-    )
-
 
 def select_channels(channel_ids, state, channels_per_run):
     if not channel_ids:
@@ -946,7 +837,6 @@ def main():
     global DEBUG, RETRIES, RETRY_BACKOFF_SEC
     os.makedirs(TMP_DIR, exist_ok=True)
 
-    run_state_migration_if_needed()
 
     cfg_path = os.path.join(BASE, "config.json")
     with open(cfg_path, "r", encoding="utf-8") as f:
