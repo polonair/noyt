@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, json, re, time, hashlib, subprocess, shutil, calendar
+import os, json, re, time, hashlib, subprocess, shutil, calendar, sqlite3
 from contextlib import contextmanager
 from collections import defaultdict
 from urllib.parse import parse_qs, urlparse
@@ -13,8 +13,9 @@ from mutagen.mp3 import MP3
 import random
 
 BASE = os.path.expanduser("~/yt-audio")
-DB_PATH = os.path.join(BASE, "data", "seen.json")
-CHANNEL_STATE_PATH = os.path.join(BASE, "data", "channel_state.json")
+SEEN_JSON_PATH = os.path.join(BASE, "data", "seen.json")
+CHANNEL_STATE_JSON_PATH = os.path.join(BASE, "data", "channel_state.json")
+STATE_DB_PATH = os.path.join(BASE, "data", "state.db")
 LOG_PATH = os.path.join(BASE, "logs", "run.log")
 TMP_DIR  = os.path.join(BASE, "tmp")
 LOCK_PATH = os.path.join(BASE, "yt_audio.lock")
@@ -281,22 +282,28 @@ def safe_name(s: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s[:180]
 
-def load_seen():
-    if not os.path.exists(DB_PATH):
-        return {}
+
+def _load_json_file(path: str, label: str, backup_on_failure: bool):
+    if not os.path.exists(path):
+        return None
 
     try:
-        with open(DB_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
     except Exception as ex:
-        bak = f"{DB_PATH}.bak.{int(time.time())}"
-        try:
-            os.replace(DB_PATH, bak)
-            log(f"seen.json parse failed, moved to backup: {bak} ({ex})")
-        except Exception as bak_ex:
-            log(f"seen.json parse failed and backup failed: {ex}; backup error: {bak_ex}")
-        return {}
+        if backup_on_failure:
+            bak = f"{path}.bak.{int(time.time())}"
+            try:
+                os.replace(path, bak)
+                log(f"{label} parse failed, moved to backup: {bak} ({ex})")
+            except Exception as bak_ex:
+                log(f"{label} parse failed and backup failed: {ex}; backup error: {bak_ex}")
+        else:
+            log(f"Failed to load {label}: {ex}; starting fresh")
+        return None
 
+
+def _parse_seen_payload(data):
     if isinstance(data, dict):
         return data
 
@@ -309,12 +316,27 @@ def load_seen():
                 vid = item.get("vid") or item.get("id") or item.get("video_id")
                 if vid:
                     converted[str(vid)] = item
-    else:
+    elif data is not None:
         log(f"Unexpected seen.json format: {type(data).__name__}; using empty state")
 
     if converted:
         log(f"Converted seen.json to dict format with {len(converted)} entries")
     return converted
+
+
+def _parse_channel_state_payload(data):
+    state = {}
+    if not isinstance(data, dict):
+        return state
+
+    for cid, meta in data.items():
+        if isinstance(meta, dict):
+            state[str(cid)] = {
+                "last_checked_at": int(meta.get("last_checked_at") or 0),
+                "fail_count": int(meta.get("fail_count") or 0),
+            }
+    return state
+
 
 def _seen_sort_key(item):
     vid, meta = item
@@ -325,56 +347,359 @@ def _seen_sort_key(item):
     return (dt, str(vid))
 
 
-def save_seen(seen, seen_max_items=5000):
-    seen_max_items = max(1, int(seen_max_items))
+class StateStore:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(db_path), exist_ok=True)
+        self.conn = sqlite3.connect(db_path)
+        self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=FULL")
+        self.conn.execute("PRAGMA foreign_keys=ON")
+        self._init_schema()
 
-    if len(seen) > seen_max_items:
-        overflow = len(seen) - seen_max_items
-        oldest = sorted(seen.items(), key=_seen_sort_key)[:overflow]
-        for vid, _ in oldest:
-            seen.pop(vid, None)
-        log(f"Pruned seen.json entries: removed={overflow}, kept={len(seen)}")
+    def _init_schema(self):
+        with self.conn:
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS seen (
+                    video_id TEXT PRIMARY KEY,
+                    title TEXT,
+                    channel TEXT,
+                    url TEXT,
+                    downloaded_at TEXT,
+                    skipped_reason TEXT,
+                    skipped_at TEXT,
+                    published_date TEXT,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            self.conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS channel_state (
+                    channel_id TEXT PRIMARY KEY,
+                    last_checked_at INTEGER NOT NULL DEFAULT 0,
+                    fail_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+        self._migrate_seen_schema_if_needed()
 
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    tmp = DB_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(seen, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, DB_PATH)
 
-def load_channel_state(channel_ids):
-    state = {}
-    if os.path.exists(CHANNEL_STATE_PATH):
+    def _migrate_seen_schema_if_needed(self):
+        cols = {
+            row["name"]: row
+            for row in self.conn.execute("PRAGMA table_info(seen)").fetchall()
+        }
+        required = ["title", "channel", "url", "downloaded_at", "skipped_reason", "skipped_at", "published_date"]
+        self._seen_has_metadata_json = "metadata_json" in cols
+
+        with self.conn:
+            for col in required:
+                if col not in cols:
+                    self.conn.execute(f"ALTER TABLE seen ADD COLUMN {col} TEXT")
+
+        if "metadata_json" not in cols:
+            return
+
+        rows = self.conn.execute("SELECT video_id, metadata_json FROM seen").fetchall()
+        with self.conn:
+            for row in rows:
+                meta = {}
+                try:
+                    decoded = json.loads(row["metadata_json"])
+                    if isinstance(decoded, dict):
+                        meta = decoded
+                except Exception:
+                    pass
+
+                self.conn.execute(
+                    """
+                    UPDATE seen
+                    SET
+                        title=COALESCE(title, ?),
+                        channel=COALESCE(channel, ?),
+                        url=COALESCE(url, ?),
+                        downloaded_at=COALESCE(downloaded_at, ?),
+                        skipped_reason=COALESCE(skipped_reason, ?),
+                        skipped_at=COALESCE(skipped_at, ?),
+                        published_date=COALESCE(published_date, ?)
+                    WHERE video_id = ?
+                    """,
+                    (
+                        meta.get("title"),
+                        meta.get("channel"),
+                        meta.get("url"),
+                        meta.get("downloaded_at"),
+                        meta.get("skipped_reason"),
+                        meta.get("skipped_at"),
+                        meta.get("published_date"),
+                        row["video_id"],
+                    ),
+                )
+
+    def close(self):
         try:
-            with open(CHANNEL_STATE_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                for cid, meta in data.items():
-                    if isinstance(meta, dict):
-                        state[cid] = {
-                            "last_checked_at": int(meta.get("last_checked_at") or 0),
-                            "fail_count": int(meta.get("fail_count") or 0),
-                        }
-        except Exception as ex:
-            log(f"Failed to load channel_state.json: {ex}; starting fresh")
+            self.conn.close()
+        except Exception:
+            pass
 
-    changed = False
-    for cid in channel_ids:
-        if cid not in state:
-            state[cid] = {"last_checked_at": 0, "fail_count": 0}
-            changed = True
+    def load_seen(self):
+        rows = self.conn.execute(
+            """
+            SELECT video_id, title, channel, url, downloaded_at, skipped_reason, skipped_at, published_date
+            FROM seen
+            """
+        ).fetchall()
+        result = {}
+        for row in rows:
+            meta = {}
+            for key in ("title", "channel", "url", "downloaded_at", "skipped_reason", "skipped_at", "published_date"):
+                value = row[key]
+                if value is not None:
+                    meta[key] = value
+            result[row["video_id"]] = meta
+        return result
 
-    if changed or not os.path.exists(CHANNEL_STATE_PATH):
-        save_channel_state(state)
+    def has_seen(self, video_id: str) -> bool:
+        row = self.conn.execute("SELECT 1 FROM seen WHERE video_id = ? LIMIT 1", (str(video_id),)).fetchone()
+        return row is not None
 
-    return state
+    def _upsert_seen_row(self, video_id: str, payload: dict, now: int):
+        if getattr(self, "_seen_has_metadata_json", False):
+            self.conn.execute(
+                """
+                INSERT INTO seen(
+                    video_id, title, channel, url, downloaded_at, skipped_reason, skipped_at, published_date, metadata_json, updated_at
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(video_id) DO UPDATE SET
+                    title=excluded.title,
+                    channel=excluded.channel,
+                    url=excluded.url,
+                    downloaded_at=excluded.downloaded_at,
+                    skipped_reason=excluded.skipped_reason,
+                    skipped_at=excluded.skipped_at,
+                    published_date=excluded.published_date,
+                    metadata_json=excluded.metadata_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    str(video_id),
+                    payload.get("title"),
+                    payload.get("channel"),
+                    payload.get("url"),
+                    payload.get("downloaded_at"),
+                    payload.get("skipped_reason"),
+                    payload.get("skipped_at"),
+                    payload.get("published_date"),
+                    json.dumps(payload, ensure_ascii=False),
+                    now,
+                ),
+            )
+            return
+
+        self.conn.execute(
+            """
+            INSERT INTO seen(
+                video_id, title, channel, url, downloaded_at, skipped_reason, skipped_at, published_date, updated_at
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(video_id) DO UPDATE SET
+                title=excluded.title,
+                channel=excluded.channel,
+                url=excluded.url,
+                downloaded_at=excluded.downloaded_at,
+                skipped_reason=excluded.skipped_reason,
+                skipped_at=excluded.skipped_at,
+                published_date=excluded.published_date,
+                updated_at=excluded.updated_at
+            """,
+            (
+                str(video_id),
+                payload.get("title"),
+                payload.get("channel"),
+                payload.get("url"),
+                payload.get("downloaded_at"),
+                payload.get("skipped_reason"),
+                payload.get("skipped_at"),
+                payload.get("published_date"),
+                now,
+            ),
+        )
+
+    def upsert_seen_item(self, video_id: str, meta, seen_max_items=5000):
+        seen_max_items = max(1, int(seen_max_items))
+        payload = meta if isinstance(meta, dict) else {}
+        now = int(time.time())
+        with self.conn:
+            self._upsert_seen_row(video_id, payload, now)
+        self.prune_seen(seen_max_items)
+
+    def save_seen(self, seen, seen_max_items=5000):
+        seen_max_items = max(1, int(seen_max_items))
+        now = int(time.time())
+        with self.conn:
+            keep_ids = {str(vid) for vid in seen.keys()}
+            if keep_ids:
+                placeholders = ",".join("?" for _ in keep_ids)
+                self.conn.execute(f"DELETE FROM seen WHERE video_id NOT IN ({placeholders})", tuple(keep_ids))
+            else:
+                self.conn.execute("DELETE FROM seen")
+
+            for vid, meta in seen.items():
+                payload = meta if isinstance(meta, dict) else {}
+                self._upsert_seen_row(str(vid), payload, now)
+        self.prune_seen(seen_max_items)
+
+    def prune_seen(self, seen_max_items=5000):
+        seen_max_items = max(1, int(seen_max_items))
+        total = int(self.conn.execute("SELECT COUNT(*) FROM seen").fetchone()[0])
+        overflow = total - seen_max_items
+        if overflow <= 0:
+            return
+
+        with self.conn:
+            self.conn.execute(
+                """
+                DELETE FROM seen
+                WHERE video_id IN (
+                    SELECT video_id
+                    FROM seen
+                    ORDER BY
+                        COALESCE(downloaded_at, ''),
+                        video_id
+                    LIMIT ?
+                )
+                """,
+                (overflow,),
+            )
+
+        log(f"Pruned seen entries: removed={overflow}, kept={total - overflow}")
+
+    def load_channel_state(self, channel_ids):
+        rows = self.conn.execute("SELECT channel_id, last_checked_at, fail_count FROM channel_state").fetchall()
+        state = {
+            row["channel_id"]: {
+                "last_checked_at": int(row["last_checked_at"] or 0),
+                "fail_count": int(row["fail_count"] or 0),
+            }
+            for row in rows
+        }
+        changed = False
+        for cid in channel_ids:
+            if cid not in state:
+                state[cid] = {"last_checked_at": 0, "fail_count": 0}
+                changed = True
+        if changed:
+            self.save_channel_state(state)
+        return state
+
+    def save_channel_state(self, state):
+        now = int(time.time())
+        with self.conn:
+            keep_ids = {str(cid) for cid in state.keys()}
+            if keep_ids:
+                placeholders = ",".join("?" for _ in keep_ids)
+                self.conn.execute(f"DELETE FROM channel_state WHERE channel_id NOT IN ({placeholders})", tuple(keep_ids))
+            else:
+                self.conn.execute("DELETE FROM channel_state")
+
+            for cid, meta in state.items():
+                payload = meta if isinstance(meta, dict) else {}
+                self.conn.execute(
+                    """
+                    INSERT INTO channel_state(channel_id, last_checked_at, fail_count, updated_at)
+                    VALUES(?, ?, ?, ?)
+                    ON CONFLICT(channel_id) DO UPDATE SET
+                        last_checked_at=excluded.last_checked_at,
+                        fail_count=excluded.fail_count,
+                        updated_at=excluded.updated_at
+                    """,
+                    (str(cid), int(payload.get("last_checked_at") or 0), int(payload.get("fail_count") or 0), now),
+                )
+
+    def touch_channel_checked(self, channel_id: str, checked_at: int | None = None):
+        ts = int(time.time()) if checked_at is None else int(checked_at)
+        with self.conn:
+            self.conn.execute(
+                """
+                INSERT INTO channel_state(channel_id, last_checked_at, fail_count, updated_at)
+                VALUES(?, ?, 0, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    last_checked_at=excluded.last_checked_at,
+                    updated_at=excluded.updated_at
+                """,
+                (str(channel_id), ts, ts),
+            )
 
 
-def save_channel_state(state):
-    os.makedirs(os.path.dirname(CHANNEL_STATE_PATH), exist_ok=True)
-    tmp = CHANNEL_STATE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, CHANNEL_STATE_PATH)
+_STATE_STORE = None
+
+
+def get_state_store() -> StateStore:
+    global _STATE_STORE
+    if _STATE_STORE is None:
+        _STATE_STORE = StateStore(STATE_DB_PATH)
+    return _STATE_STORE
+
+
+
+
+def close_state_store():
+    global _STATE_STORE
+    if _STATE_STORE is None:
+        return
+    try:
+        _STATE_STORE.close()
+    finally:
+        _STATE_STORE = None
+
+def run_state_migration_if_needed():
+    os.makedirs(os.path.dirname(STATE_DB_PATH), exist_ok=True)
+
+    db_exists = os.path.exists(STATE_DB_PATH)
+    seen_exists = os.path.exists(SEEN_JSON_PATH)
+    channel_exists = os.path.exists(CHANNEL_STATE_JSON_PATH)
+
+    if db_exists:
+        return
+
+    if not (seen_exists or channel_exists):
+        return
+
+    log("State migration: detected legacy JSON state and no SQLite DB; starting migration")
+
+    seen_payload = _load_json_file(SEEN_JSON_PATH, "seen.json", backup_on_failure=True)
+    channel_payload = _load_json_file(CHANNEL_STATE_JSON_PATH, "channel_state.json", backup_on_failure=False)
+
+    seen_state = _parse_seen_payload(seen_payload)
+    channel_state = _parse_channel_state_payload(channel_payload)
+
+    store = StateStore(STATE_DB_PATH)
+    try:
+        if seen_state:
+            store.save_seen(dict(seen_state), seen_max_items=max(1, len(seen_state)))
+        if channel_state:
+            store.save_channel_state(channel_state)
+    finally:
+        store.close()
+
+    suffix = datetime.now().strftime("%Y%m%d%H%M%S")
+    for path in (SEEN_JSON_PATH, CHANNEL_STATE_JSON_PATH):
+        if os.path.exists(path):
+            migrated_path = f"{path}.migrated.{suffix}"
+            try:
+                os.replace(path, migrated_path)
+                log(f"Renamed migrated legacy state file: {migrated_path}")
+            except Exception as ex:
+                log(f"Failed to rename migrated state file {path}: {ex}")
+
+    log(
+        f"State migration completed: seen={len(seen_state)}, channel_state={len(channel_state)}, db={STATE_DB_PATH}"
+    )
 
 
 def select_channels(channel_ids, state, channels_per_run):
@@ -621,6 +946,8 @@ def main():
     global DEBUG, RETRIES, RETRY_BACKOFF_SEC
     os.makedirs(TMP_DIR, exist_ok=True)
 
+    run_state_migration_if_needed()
+
     cfg_path = os.path.join(BASE, "config.json")
     with open(cfg_path, "r", encoding="utf-8") as f:
         cfg = json.load(f)
@@ -647,8 +974,8 @@ def main():
     cleanup_tmp_dir(max_age_hours=tmp_max_age_hours)
 
     os.makedirs(library_dir, exist_ok=True)
-    seen = load_seen()
-    channel_state = load_channel_state(channel_ids)
+    state_store = get_state_store()
+    channel_state = state_store.load_channel_state(channel_ids)
 
     selected_channels = select_channels(channel_ids, channel_state, channels_per_run)
     if randomize_feeds:
@@ -688,7 +1015,7 @@ def main():
             if not vid:
                 log(f"Could not extract video id from entry: {url}")
 
-            if vid and vid in seen:
+            if vid and state_store.has_seen(vid):
                 skipped_by_reason["already_seen"] += 1
                 continue
 
@@ -696,15 +1023,14 @@ def main():
             entry_publish_date = entry_publish_dt.date() if entry_publish_dt else None
 
             if min_publish_date and vid and entry_publish_date and entry_publish_date < min_publish_date:
-                seen[vid] = {
+                state_store.upsert_seen_item(vid, {
                     "url": url,
                     "skipped_reason": "older_than_min_publish_date",
                     "skipped_at": datetime.now().isoformat(timespec="seconds"),
                     "published_date": entry_publish_date.isoformat(),
                     "title": str(getattr(e, "title", "") or "") or None,
                     "channel": str(getattr(e, "author", "") or "") or None,
-                }
-                save_seen(seen, seen_max_items=seen_max_items)
+                }, seen_max_items=seen_max_items)
                 skipped_by_reason["older_than_min_publish_date"] += 1
                 continue
 
@@ -717,20 +1043,19 @@ def main():
 
             vid = vid or meta["id"] or hashlib.sha1(url.encode("utf-8")).hexdigest()[:12]
 
-            if vid in seen:
+            if state_store.has_seen(vid):
                 skipped_by_reason["already_seen"] += 1
                 continue
 
             if min_publish_date and entry_publish_date and entry_publish_date < min_publish_date:
-                seen[vid] = {
+                state_store.upsert_seen_item(vid, {
                     "url": meta.get("webpage_url") or url,
                     "skipped_reason": "older_than_min_publish_date",
                     "skipped_at": datetime.now().isoformat(timespec="seconds"),
                     "published_date": entry_publish_date.isoformat(),
                     "title": meta.get("title") or str(getattr(e, "title", "") or "") or None,
                     "channel": meta.get("channel") or str(getattr(e, "author", "") or "") or None,
-                }
-                save_seen(seen, seen_max_items=seen_max_items)
+                }, seen_max_items=seen_max_items)
                 skipped_by_reason["older_than_min_publish_date"] += 1
                 continue
 
@@ -745,15 +1070,14 @@ def main():
                         log(f"Invalid upload_date in metadata: {upload_date} ({url})")
 
                 if meta_publish_date and meta_publish_date < min_publish_date:
-                    seen[vid] = {
+                    state_store.upsert_seen_item(vid, {
                         "url": meta.get("webpage_url") or url,
                         "skipped_reason": "older_than_min_publish_date",
                         "skipped_at": datetime.now().isoformat(timespec="seconds"),
                         "published_date": meta_publish_date.isoformat(),
                         "title": meta.get("title") or None,
                         "channel": meta.get("channel") or None,
-                    }
-                    save_seen(seen, seen_max_items=seen_max_items)
+                    }, seen_max_items=seen_max_items)
                     skipped_by_reason["older_than_min_publish_date"] += 1
                     continue
 
@@ -763,8 +1087,9 @@ def main():
 
             if total_new >= download_per_run:
                 log(f"Reached download_per_run={download_per_run}, stopping.")
-                channel_state[channel_id]["last_checked_at"] = int(time.time())
-                save_channel_state(channel_state)
+                checked_at = int(time.time())
+                channel_state[channel_id]["last_checked_at"] = checked_at
+                state_store.touch_channel_checked(channel_id, checked_at)
                 finish_run()
                 return
 
@@ -842,13 +1167,12 @@ def main():
                 os.replace(tmp_final, final_path)
                 cleanup_tmp_out(tmp_out, mp3_path=mp3_path)
 
-                seen[vid] = {
+                state_store.upsert_seen_item(vid, {
                     "title": title,
                     "channel": channel,
                     "url": meta["webpage_url"],
                     "downloaded_at": datetime.now().isoformat(timespec="seconds")
-                }
-                save_seen(seen, seen_max_items=seen_max_items)
+                }, seen_max_items=seen_max_items)
 
                 total_new += 1
                 log(f"OK: {final_path}")
@@ -864,12 +1188,16 @@ def main():
                 skipped_by_reason["download_or_tag_failed"] += 1
                 log(f"FAIL: {url} -> {ex}")
 
-        channel_state[channel_id]["last_checked_at"] = int(time.time())
-        save_channel_state(channel_state)
+        checked_at = int(time.time())
+        channel_state[channel_id]["last_checked_at"] = checked_at
+        state_store.touch_channel_checked(channel_id, checked_at)
 
     finish_run()
 
 if __name__ == "__main__":
     with single_instance_lock() as acquired:
-        if acquired:
-            main()
+        try:
+            if acquired:
+                main()
+        finally:
+            close_state_store()
