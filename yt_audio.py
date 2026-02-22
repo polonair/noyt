@@ -101,8 +101,11 @@ def _is_lock_owner_alive(lock_info: dict | None) -> bool:
     try:
         with open(cmdline_path, "rb") as f:
             cmdline = f.read().replace(b"\x00", b" ").decode("utf-8", errors="ignore")
-        if script_name and script_name not in cmdline:
-            return False
+        # cmdline используется только как дополнительная эвристика и не должен
+        # опровергать валидность живого процесса-владельца (например, при запуске
+        # через обёртку, симлинк или `python -m`).
+        if script_name and script_name in cmdline:
+            debug_log(f"Lock owner cmdline matches script name: pid={pid}")
     except Exception:
         # Если cmdline недоступен, PID+start_ticks уже дают достаточную защиту.
         pass
@@ -131,10 +134,22 @@ def single_instance_lock():
             log(f"Single instance lock acquired: {LOCK_PATH} (pid={lock_info['pid']})")
             break
         except FileExistsError:
-            existing = _read_lock_info()
+            existing = None
+            for _ in range(5):
+                existing = _read_lock_info()
+                if isinstance(existing, dict):
+                    break
+                # Защита от гонки: файл уже создан, но владелец ещё не успел
+                # дописать JSON-метаданные. Нельзя сразу считать lock устаревшим.
+                time.sleep(0.05)
+
             if _is_lock_owner_alive(existing):
                 owner_pid = existing.get("pid") if isinstance(existing, dict) else "unknown"
                 log(f"Refusing to start: another instance is running (pid={owner_pid})")
+                break
+
+            if existing is None:
+                log(f"Lock file exists but metadata is not readable yet: {LOCK_PATH}; refusing to start")
                 break
 
             try:
