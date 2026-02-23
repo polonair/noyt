@@ -873,6 +873,9 @@ def main():
         except Exception as ex:
             skipped_by_reason["channel_feed_failed"] += 1
             log(f"Feed failed: {channel_url} -> {ex}")
+            checked_at = int(time.time())
+            channel_state[channel_id]["last_checked_at"] = checked_at
+            state_store.touch_channel_checked(channel_id, checked_at)
             continue
 
         for e in entries:
