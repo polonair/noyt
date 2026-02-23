@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-import os, json, re, time, hashlib, subprocess, shutil, calendar, sqlite3
+import os, json, re, time, hashlib, subprocess, shutil, sqlite3
 from contextlib import contextmanager
 from collections import defaultdict
-from urllib.parse import parse_qs, urlparse
 from io import BytesIO
 from PIL import Image
 from datetime import datetime, date
-import feedparser
 import requests
 from mutagen.id3 import ID3, APIC, USLT, TIT2, TPE1, TALB, TDRC
 from mutagen.mp3 import MP3
@@ -665,6 +663,21 @@ def yt_meta(url: str):
     }
 
 
+def yt_channel_entries(channel_id: str, max_per_feed: int):
+    channel_url = f"https://www.youtube.com/channel/{channel_id}/videos"
+    out = run([
+        "yt-dlp",
+        "-J",
+        "--flat-playlist",
+        "--playlist-end",
+        str(max_per_feed),
+        channel_url,
+    ])
+    data = json.loads(out)
+    entries = data.get("entries")
+    return entries if isinstance(entries, list) else []
+
+
 def should_download(meta, min_duration_sec, max_duration_sec):
     live_status = str(meta.get("live_status") or "").lower()
     active_live_statuses = {"is_live", "live", "is_upcoming", "upcoming"}
@@ -694,40 +707,6 @@ def should_download(meta, min_duration_sec, max_duration_sec):
         return False
 
     return True
-
-def extract_vid(entry) -> str | None:
-    yt_videoid = entry.get("yt_videoid")
-    if yt_videoid:
-        return str(yt_videoid)
-
-    entry_id = entry.get("id")
-    if entry_id:
-        match = re.match(r"^yt:video:([A-Za-z0-9_-]{6,})$", str(entry_id))
-        if match:
-            return match.group(1)
-
-    link = entry.get("link")
-    if link:
-        parsed = urlparse(str(link))
-        vid = parse_qs(parsed.query).get("v", [None])[0]
-        if vid:
-            return vid
-
-    return None
-
-
-def get_entry_publish_dt(entry) -> datetime | None:
-    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
-    if not parsed:
-        return None
-
-    try:
-        ts_utc = calendar.timegm(parsed)
-    except Exception:
-        return None
-
-    return datetime.utcfromtimestamp(ts_utc)
-
 
 def parse_min_publish_date(cfg_value) -> date | None:
     if cfg_value is None:
@@ -887,29 +866,31 @@ def main():
 
     for channel_id in selected_channels:
         channels_checked += 1
-        feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
-        log(f"Feed: {feed_url}")
-        d = feedparser.parse(feed_url)
-        #log(f"d = {d}")
-        entries = d.entries[:max_per_feed]
+        channel_url = f"https://www.youtube.com/channel/{channel_id}/videos"
+        log(f"Feed: {channel_url}")
+        try:
+            entries = yt_channel_entries(channel_id, max_per_feed)
+        except Exception as ex:
+            skipped_by_reason["channel_feed_failed"] += 1
+            log(f"Feed failed: {channel_url} -> {ex}")
+            checked_at = int(time.time())
+            channel_state[channel_id]["last_checked_at"] = checked_at
+            state_store.touch_channel_checked(channel_id, checked_at)
+            continue
 
         for e in entries:
-            url = getattr(e, "link", None)
-            if not url:
-                skipped_by_reason["entry_without_link"] += 1
-                continue
-            log(f"Link: {url}")
-            # ключ дедупликации — видео id, если нет — хэш ссылки
-            vid = extract_vid(e)
+            vid = str(e.get("id") or "").strip()
             if not vid:
-                log(f"Could not extract video id from entry: {url}")
+                skipped_by_reason["entry_without_id"] += 1
+                continue
+            url = f"https://www.youtube.com/watch?v={vid}"
+            log(f"Link: {url}")
 
             if vid and state_store.has_seen(vid):
                 skipped_by_reason["already_seen"] += 1
                 continue
 
-            entry_publish_dt = get_entry_publish_dt(e)
-            entry_publish_date = entry_publish_dt.date() if entry_publish_dt else None
+            entry_publish_date = None
 
             if min_publish_date and vid and entry_publish_date and entry_publish_date < min_publish_date:
                 state_store.upsert_seen_item(vid, {
@@ -917,8 +898,8 @@ def main():
                     "skipped_reason": "older_than_min_publish_date",
                     "skipped_at": datetime.now().isoformat(timespec="seconds"),
                     "published_date": entry_publish_date.isoformat(),
-                    "title": str(getattr(e, "title", "") or "") or None,
-                    "channel": str(getattr(e, "author", "") or "") or None,
+                    "title": str(e.get("title", "") or "") or None,
+                    "channel": str(e.get("channel", "") or "") or None,
                 }, seen_max_items=seen_max_items)
                 skipped_by_reason["older_than_min_publish_date"] += 1
                 continue
@@ -942,8 +923,8 @@ def main():
                     "skipped_reason": "older_than_min_publish_date",
                     "skipped_at": datetime.now().isoformat(timespec="seconds"),
                     "published_date": entry_publish_date.isoformat(),
-                    "title": meta.get("title") or str(getattr(e, "title", "") or "") or None,
-                    "channel": meta.get("channel") or str(getattr(e, "author", "") or "") or None,
+                    "title": meta.get("title") or str(e.get("title", "") or "") or None,
+                    "channel": meta.get("channel") or str(e.get("channel", "") or "") or None,
                 }, seen_max_items=seen_max_items)
                 skipped_by_reason["older_than_min_publish_date"] += 1
                 continue
