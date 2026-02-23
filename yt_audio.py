@@ -11,6 +11,7 @@ from mutagen.mp3 import MP3
 import random
 
 BASE = os.path.expanduser("~/yt-audio")
+COOKIES_DIR = os.path.join(BASE, "cookies")
 STATE_DB_PATH = os.path.join(BASE, "data", "state.db")
 LOG_PATH = os.path.join(BASE, "logs", "run.log")
 TMP_DIR  = os.path.join(BASE, "tmp")
@@ -612,6 +613,46 @@ def run_once(cmd):
 def run(cmd):
     return with_retries(f"Command {' '.join(cmd[:2])}", lambda: run_once(cmd))
 
+
+def list_cookie_files() -> list[str]:
+    if not os.path.isdir(COOKIES_DIR):
+        return []
+
+    try:
+        cookie_paths = [
+            os.path.join(COOKIES_DIR, name)
+            for name in os.listdir(COOKIES_DIR)
+            if name.endswith(".txt") and os.path.isfile(os.path.join(COOKIES_DIR, name))
+        ]
+    except Exception as ex:
+        log(f"Failed to read cookies dir: {COOKIES_DIR} -> {ex}")
+        return []
+
+    return sorted(cookie_paths)
+
+
+def run_yt_dlp(cmd: list[str]) -> str:
+    if not cmd or cmd[0] != "yt-dlp":
+        return run(cmd)
+
+    cookie_files = list_cookie_files()
+    if not cookie_files:
+        return run(cmd)
+
+    last_ex = None
+    for cookie_path in cookie_files:
+        cmd_with_cookies = ["yt-dlp", "--cookies", cookie_path] + cmd[1:]
+        log(f"Trying cookies: {cookie_path}")
+        try:
+            out = run(cmd_with_cookies)
+            log(f"Cookies OK: {cookie_path}")
+            return out
+        except Exception as ex:
+            last_ex = ex
+            log(f"Cookies failed: {cookie_path} -> {ex}")
+
+    raise last_ex
+
 def _thumb_rank(item):
     if not isinstance(item, dict):
         return (-1, 0)
@@ -646,7 +687,7 @@ def pick_thumbnail_url(j):
 
 def yt_meta(url: str):
     # Получаем метаданные одним вызовом yt-dlp
-    out = run(["yt-dlp", "-J", "--no-warnings", "--no-playlist", url])
+    out = run_yt_dlp(["yt-dlp", "-J", "--no-warnings", "--no-playlist", url])
     j = json.loads(out)
     return {
         "id": j.get("id"),
@@ -665,7 +706,7 @@ def yt_meta(url: str):
 
 def yt_channel_entries(channel_id: str, max_per_feed: int):
     channel_url = f"https://www.youtube.com/channel/{channel_id}/videos"
-    out = run([
+    out = run_yt_dlp([
         "yt-dlp",
         "-J",
         "--flat-playlist",
@@ -726,7 +767,7 @@ def download_audio(url: str, outdir: str, basename: str) -> str:
     os.makedirs(outdir, exist_ok=True)
     # yt-dlp сам вытащит лучшее аудио и сконвертит в mp3 через ffmpeg
     template = os.path.join(outdir, basename + ".%(ext)s")
-    run([
+    run_yt_dlp([
         "yt-dlp",
         "-f", "bestaudio/best",
         "--no-playlist",
